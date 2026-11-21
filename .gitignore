@@ -1,0 +1,6 @@
+.*
+**/__pycache__
+VBCABLE_Driver_Pack*.zip
+
+!.gitignore
+!.python-version
