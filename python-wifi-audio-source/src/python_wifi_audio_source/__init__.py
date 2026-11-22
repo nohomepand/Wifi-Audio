@@ -57,7 +57,7 @@ class Command():
             dest="blocksize",
             type=int,
             default=_setting.BLOCKSIZE,
-            choices=[128, 256, 512],
+            choices=[128, 128 * 2, 128 * 3, 128 * 4],
             help="Audio sampling block size (defaults=%(default)s)",
         )
         return self

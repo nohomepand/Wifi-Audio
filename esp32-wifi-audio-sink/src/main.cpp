@@ -13,8 +13,16 @@ public:
     AppPreference(const char* ns) : ns(ns) {}
 
     void init() {
+        ap_mode.init(ns, "ap_mode", false);
+
         ssid.init(ns, "ssid", "Set Wifi SSID!");
         pass.init(ns, "pass", "Set Wifi Passphrase!");
+
+        ap_ssid.init(ns, "ap_ssid", "Set AP SSID!");
+        ap_hide_ssid.init(ns, "ap_hide_ssid", true);
+        ap_pass.init(ns, "ap_pass", "Set AP Passphrase!");
+        ap_ip_net.init(ns, "ap_ip_net", "10.1.1.1/24");
+
         port.init(ns, "port", 2528);
 
         ledpin.init(ns, "ledpin", 8);
@@ -29,8 +37,16 @@ public:
         // i2s_swaplr.init(ns, "i2s_swaplr", false);
     }
 
+    DEFINE_NVS_PROP(bool, ap_mode);
+
     DEFINE_NVS_PROP(String, ssid);
     DEFINE_NVS_PROP(String, pass);
+    
+    DEFINE_NVS_PROP(String, ap_ssid);
+    DEFINE_NVS_PROP(bool, ap_hide_ssid);
+    DEFINE_NVS_PROP(String, ap_pass);
+    DEFINE_NVS_PROP(String, ap_ip_net); // syntax x.y.z.w/<network>
+
     DEFINE_NVS_PROP(uint16_t, port);
 
     DEFINE_NVS_PROP(int, ledpin);
@@ -57,14 +73,34 @@ void _setWifiConnected(bool value) {
         analogWrite((int) apppref.ledpin, 0x7f);
     WifiConnected = value;
 }
+
 WiFiUDP udp;
+
 class UDPReceiveTask : public rtos::Task {
 private:
-    uint8_t packetBuffer[512 * 3];
+    uint8_t packetBuffer[512 * 3]; // 足りる？
 public:
-    UDPReceiveTask() : rtos::Task("udprcv", 4096U, 2) {}
+    UDPReceiveTask() : rtos::Task("udprcv", 4096U, 2) {
+        // Wi-Fi接続と省電力モードの完全無効化
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(apppref.ssid.c_str(), apppref.pass.c_str());
+        WiFi.setSleep(false);
+        esp_wifi_set_ps(WIFI_PS_NONE);
 
-    void feed() {
+        Serial.print("Wi-Fi接続中");
+        for (auto i = 0; WiFi.status() != WL_CONNECTED && i < 30; i++) {
+            delay(250);
+            Serial.print(".");
+        }
+        _setWifiConnected(WiFi.status() == WL_CONNECTED);
+        if (WifiConnected) {
+            udp.begin(apppref.port);
+            Serial.printf("\n接続完了! IPアドレス: %s\n", WiFi.localIP().toString().c_str());
+        } else
+            Serial.println("\n接続失敗");
+    }
+
+    bool feed() {
         if (!WifiConnected) {
             sleepMs(250);
             _setWifiConnected(WiFi.status() == WL_CONNECTED);
@@ -72,7 +108,7 @@ public:
                 udp.begin(apppref.port);
                 Serial.printf("\n接続完了! IPアドレス: %s\n", WiFi.localIP().toString().c_str());
             }
-            return;
+            return false;
         }
         int packetSize = udp.parsePacket();
         if (packetSize > 0) {
@@ -82,14 +118,115 @@ public:
                 // 受信したPCMデータを直接I2S DMAへ書き込み
                 // i2s_write(I2S_PORT, packetBuffer, len, &bytes_written, pdMS_TO_TICKS(100));
                 i2s_write(I2S_PORT, packetBuffer, len, &bytes_written, portMAX_DELAY);
+                return true;
             }
         }
+        return false;
     }
 protected:
     void run() override {
         while(true) {
-            feed();
-            vTaskDelay(1);
+            if (!feed())
+                vTaskDelay(1);
+        }
+    }
+};
+
+IPAddress NULL_IPADDRESS{0, 0, 0, 0};
+class APUDPReceiveTask : public rtos::Task {
+private:
+    uint8_t packetBuffer[512 * 3]; // 足りる？
+
+    // x.y.z.w(/net)
+    std::pair<bool, std::pair<IPAddress, IPAddress>> _parse_ip_net(const String& ip_net) {
+        auto slashIdx = ip_net.indexOf('/');
+        IPAddress localAndGatewayIP;
+        int netmaskbitsLen = 24;
+
+        if (slashIdx == -1) {
+            if (!localAndGatewayIP.fromString(ip_net)) {
+                return {false, {NULL_IPADDRESS, NULL_IPADDRESS}};
+            }
+        } else {
+            if (!localAndGatewayIP.fromString(ip_net.substring(0, slashIdx))) {
+                return {false, {NULL_IPADDRESS, NULL_IPADDRESS}};
+            }
+            // 1. slashIdx + 1 で '/' の次の文字から取得する
+            String maskStr = ip_net.substring(slashIdx + 1);
+            if (maskStr.length() == 0) {
+                return {false, {NULL_IPADDRESS, NULL_IPADDRESS}};
+            }
+            netmaskbitsLen = maskStr.toInt();
+            // 3. 範囲外チェック（0〜32以外、または数値変換失敗時など）
+            if (netmaskbitsLen < 0 || netmaskbitsLen > 32) {
+                return {false, {NULL_IPADDRESS, NULL_IPADDRESS}};
+            }
+        }
+
+        // 3. 0 と 32 を安全に処理
+        uint32_t netmaskIPBits = 0;
+        if (netmaskbitsLen == 32) {
+            netmaskIPBits = 0xffffffffUL;
+        } else if (netmaskbitsLen > 0) {
+            netmaskIPBits = 0xffffffffUL << (32 - netmaskbitsLen);
+        }
+
+        IPAddress netmaskIP {
+            (uint8_t) ((netmaskIPBits >> 24) & 0xff),
+            (uint8_t) ((netmaskIPBits >> 16) & 0xff),
+            (uint8_t) ((netmaskIPBits >> 8) & 0xff),
+            (uint8_t) (netmaskIPBits & 0xff),
+        };
+        return {true, {localAndGatewayIP, netmaskIP}};
+    }
+
+public:
+    APUDPReceiveTask() : rtos::Task("APudprcv", 4096, 2) {
+        auto parsedIPNET = _parse_ip_net(apppref.ap_ip_net);
+        if (!parsedIPNET.first) {
+            Serial.printf("IP/NET の構文にエラーがあります: [%s]\n", apppref.ap_ip_net);
+            _setWifiConnected(false);
+        } else {
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_AP);
+            if (!WiFi.softAP(apppref.ap_ssid.c_str(), apppref.ap_pass.c_str(), 1, (bool) apppref.ap_hide_ssid ? 1 : 0)) {
+                Serial.println("SoftAPの起動に失敗しました");
+            } else {
+                delay(100); // APインターフェース初期化待ち
+                Serial.printf("SoftAP 構成開始 local_IP=[%s] gateway=[%s] subnet=[%s]\n", parsedIPNET.second.first.toString().c_str(), parsedIPNET.second.first.toString().c_str(), parsedIPNET.second.second.toString().c_str());
+                if (!WiFi.softAPConfig(parsedIPNET.second.first, parsedIPNET.second.first, parsedIPNET.second.second)) {
+                    Serial.println("SoftAPの構成に失敗しました");
+                } else {
+                    Serial.printf("SoftAP IP address=[%s]\n", WiFi.softAPIP().toString().c_str());
+                    esp_wifi_set_ps(WIFI_PS_NONE);
+                    udp.begin(apppref.port);
+                    _setWifiConnected(true);
+                }
+            }
+        }
+    }
+    
+    bool feed() {
+        if (!WifiConnected) {
+            return false;
+        }
+        int packetSize = udp.parsePacket();
+        if (packetSize > 0) {
+            int len = udp.read(packetBuffer, sizeof(packetBuffer));
+            if (len > 0) {
+                size_t bytes_written = 0;
+                // 受信したPCMデータを直接I2S DMAへ書き込み
+                i2s_write(I2S_PORT, packetBuffer, len, &bytes_written, portMAX_DELAY);
+                return true;
+            }
+        }
+        return false;
+    }
+protected:
+    void run() override {
+        while(true) {
+            if (!feed())
+                vTaskDelay(1);
         }
     }
 };
@@ -138,24 +275,6 @@ void setup() {
     // I2S初期化
     setupI2S();
 
-    // Wi-Fi接続と省電力モードの完全無効化
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(apppref.ssid.c_str(), apppref.pass.c_str());
-    WiFi.setSleep(false);
-    esp_wifi_set_ps(WIFI_PS_NONE);
-
-    Serial.print("Wi-Fi接続中");
-    for (auto i = 0; WiFi.status() != WL_CONNECTED && i < 30; i++) {
-        delay(250);
-        Serial.print(".");
-    }
-    _setWifiConnected(WiFi.status() == WL_CONNECTED);
-    if (WifiConnected) {
-        udp.begin(apppref.port);
-        Serial.printf("\n接続完了! IPアドレス: %s\n", WiFi.localIP().toString().c_str());
-    } else
-        Serial.println("\n接続失敗");
-
     {
         appcli.registerHandler("reset", [](String args) {
             ESP.restart();
@@ -165,40 +284,75 @@ void setup() {
         }, "Show this message");
         
         appcli.registerHandler("status", [](String args) {
+            Serial.printf("WiFi Mode=[%s]\n", (bool) apppref.ap_mode ? "AP Mode" : "STA(Client) Mode");
             Serial.printf("SSID=[%s]\n", apppref.ssid.c_str());
             Serial.printf("Pass=[%s]\n", apppref.pass.c_str());
-            Serial.printf("Wifi ... %s\n", WifiConnected ? WiFi.localIP().toString().c_str() : "(not connected)");
+            Serial.printf("Wifi ... %s\n",
+                WifiConnected ? (
+                    (bool) apppref.ap_mode ?
+                        WiFi.softAPIP().toString().c_str() :
+                        WiFi.localIP().toString().c_str()
+                ) : "(not connected)"
+            );
+            Serial.printf("AP SSID=[%s] hide=[%s]\n", apppref.ap_ssid.c_str(), (bool) apppref.ap_hide_ssid ? "HIDDEN" : "visible");
+            Serial.printf("AP Pass=[%s]\n", apppref.ap_pass.c_str());
+            Serial.printf("AP IP/NET=[%s]\n", apppref.ap_ip_net.c_str());
             Serial.printf("Port=[%d]\n", (uint16_t) apppref.port);
             Serial.printf("LED pin=[%d] [%s]\n", (int) apppref.ledpin, (bool) apppref.invert_led ? "inverted" : "normal");
             Serial.printf("BCLK=[%d]\n", (int) apppref.bclk);
             Serial.printf("WS/LRC=[%d]\n", (int) apppref.ws_or_lrc);
             Serial.printf("DOUT=[%d]\n", (int) apppref.dout);
             Serial.printf("Samplerate=[%d]\n", (uint32_t) apppref.i2s_samplerate);
-            Serial.printf("Bis per seconds=[%d]\n", (i2s_bits_per_sample_t) apppref.i2s_bps);
+            Serial.printf("Bis per sample=[%d]\n", (i2s_bits_per_sample_t) apppref.i2s_bps);
         }, "Show current settings");
+
+        appcli.registerHandler("ap-mode", [](String args) {
+            apppref.ap_mode = args.equals("true");
+            Serial.printf("Wifi mode set to [%s]\n", (bool) apppref.ap_mode ? "AP Mode" : "STA(Client) Mode");
+        }, "Set or unset AP mode <true or false>");
+
         appcli.registerHandler("ssid", [](String args) {
             args.trim();
             apppref.ssid = args;
-            Preferences prefs;
-            prefs.begin("wifi-audio-sink", false);
-            size_t written = prefs.putString("ssid", args);
-            prefs.end();
-            prefs.begin("wifi-audio-sink", true);
-            String saved = prefs.getString("ssid", "");
-            prefs.end();
-            Serial.printf("Wifi SSID set to [%s], saved=[%s]\n", apppref.ssid.c_str(), saved.c_str());
-            if (written == 0)
-                Serial.println("NVS write failed");
+            Serial.printf("Wifi SSID set to [%s]\n", apppref.ssid.c_str());
+            // Preferences prefs;
+            // prefs.begin("wifi-audio-sink", false);
+            // size_t written = prefs.putString("ssid", args);
+            // prefs.end();
+            // prefs.begin("wifi-audio-sink", true);
+            // String saved = prefs.getString("ssid", "");
+            // prefs.end();
+            // Serial.printf("Wifi SSID set to [%s], saved=[%s]\n", apppref.ssid.c_str(), saved.c_str());
+            // if (written == 0)
+            //     Serial.println("NVS write failed");
         }, "Set Wifi SSID");
         appcli.registerHandler("pass", [](String args) {
             args.trim();
             apppref.pass = args;
-            Preferences prefs;
-            prefs.begin("wifi-audio-sink", false);
-            size_t written = prefs.putString("pass", args);
-            prefs.end();
-            Serial.printf("Wifi Passphrase set, NVS bytes written=[%u]\n", (unsigned)written);
+            Serial.printf("Wifi Passphrase set to [%s]\n", args.c_str());
+            // Preferences prefs;
+            // prefs.begin("wifi-audio-sink", false);
+            // size_t written = prefs.putString("pass", args);
+            // prefs.end();
+            // Serial.printf("Wifi Passphrase set, NVS bytes written=[%u]\n", (unsigned)written);
         }, "Set Wifi Passphrase");
+
+        appcli.registerHandler("ap-ssid", [](String args) {
+            args.trim();
+            apppref.ap_ssid = args;
+            Serial.printf("AP SSID set to [%s]\n", args.c_str());
+        }, "Set AP mode SSID");
+        appcli.registerHandler("ap-pass", [](String args) {
+            args.trim();
+            apppref.ap_pass = args;
+            Serial.printf("AP Passphrase set to [%s]\n", args.c_str());
+        }, "Set AP mode Passphrase");
+        appcli.registerHandler("ap-ipnet", [](String args) {
+            args.trim();
+            apppref.ap_ip_net = args;
+            Serial.printf("AP IP/NET set to [%s]\n", args.c_str());
+        }, "Set AP mode IP/NET(x.y.z.w(/net) format)");
+
         appcli.registerHandler("port", [](String args) {
             apppref.port = (uint32_t) args.toInt();
             Serial.printf("Port set to [%d]\n", (uint32_t) apppref.port);
@@ -247,7 +401,11 @@ void setup() {
         }, "Set I2S Bits per seconds (16 or 32)");
     }
 
-    tasks.push_back(new UDPReceiveTask());
+    if ((bool) apppref.ap_mode) {
+        tasks.push_back(new APUDPReceiveTask());
+    } else {
+        tasks.push_back(new UDPReceiveTask());
+    }
     for (auto it : tasks)
         it->start();
 }

@@ -6,7 +6,8 @@
     * VB Audio Cable (オーディオキャプチャ用)
     * VSCode + PlatformIO
     * uv or Python3.15
-    * WiFi 環境 (STAではなくクライアントとして動作するため)
+    * WiFi 環境
+        * 2026/11/22 から SoftAPモードにも対応
     * ESP32系のマイコン (ESP32-S3 Super Miniなど, WiFi使えれば安価なものでもよさそう)
     * MAX98357A や PCM5102A などの外部 I2S DACブレークアウトボード
 
