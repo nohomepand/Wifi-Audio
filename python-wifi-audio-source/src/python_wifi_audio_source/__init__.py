@@ -102,7 +102,13 @@ def find_wasapi_vbcable():
 
 def audio_callback(indata: np.ndarray, frames, time, status):
     # コンソール出力（print）は遅延の原因になるため省き、最速でUDP送出
-    sock.sendto(indata.tobytes(), (_setting.HOST_IP, _setting.HOST_PORT))
+    try:
+        sock.sendto(indata.tobytes(), (_setting.HOST_IP, _setting.HOST_PORT))
+    except KeyboardInterrupt:
+        raise
+    except:
+        # e.g Network error
+        pass
 
 def main():
     Command().setup().action()

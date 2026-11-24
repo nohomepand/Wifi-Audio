@@ -65,4 +65,6 @@
 
 ## Audio source (rust)
 
-**WIP**
+1. VSCode で rust-wifi-audio-source フォルダを開く
+2. `cargo build` する
+3. `cargo run -- [ESP32のIPアドレス]:2528` を実行

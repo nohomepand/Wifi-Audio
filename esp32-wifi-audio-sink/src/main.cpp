@@ -45,7 +45,7 @@ public:
     DEFINE_NVS_PROP(String, ap_ssid);
     DEFINE_NVS_PROP(bool, ap_hide_ssid);
     DEFINE_NVS_PROP(String, ap_pass);
-    DEFINE_NVS_PROP(String, ap_ip_net); // syntax x.y.z.w/<network>
+    DEFINE_NVS_PROP(String, ap_ip_net); // syntax x.y.z.w(/<network>)
 
     DEFINE_NVS_PROP(uint16_t, port);
 
@@ -64,21 +64,24 @@ private:
 } apppref("wifi-audio-sink");
 
 constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
-
+IPAddress NULL_IPADDRESS{0, 0, 0, 0};
 bool WifiConnected = false;
-void _setWifiConnected(bool value) {
-    if (value)
+IPAddress WifiIPAddress;
+WiFiUDP udp;
+uint8_t packetBuffer[512 * 10]; // 足りる？
+
+void _setWifiConnected(bool value, const IPAddress& addr) {
+    if (value) {
         digitalWrite((int) apppref.ledpin, (bool) apppref.invert_led ? HIGH : LOW);
-    else
+        WifiIPAddress = addr;
+    } else
         analogWrite((int) apppref.ledpin, 0x7f);
     WifiConnected = value;
 }
 
-WiFiUDP udp;
-
 class UDPReceiveTask : public rtos::Task {
 private:
-    uint8_t packetBuffer[512 * 3]; // 足りる？
+    // uint8_t packetBuffer[512 * 3]; // 足りる？
 public:
     UDPReceiveTask() : rtos::Task("udprcv", 4096U, 2) {
         // Wi-Fi接続と省電力モードの完全無効化
@@ -92,19 +95,18 @@ public:
             delay(250);
             Serial.print(".");
         }
-        _setWifiConnected(WiFi.status() == WL_CONNECTED);
-        if (WifiConnected) {
+        if (WiFi.status() == WL_CONNECTED) {
+            _setWifiConnected(true, WiFi.localIP());
             udp.begin(apppref.port);
-            Serial.printf("\n接続完了! IPアドレス: %s\n", WiFi.localIP().toString().c_str());
-        } else
-            Serial.println("\n接続失敗");
+            Serial.printf("\n接続完了 IPアドレス: %s\n", WifiIPAddress.toString().c_str());
+        }
     }
 
     bool feed() {
         if (!WifiConnected) {
             sleepMs(250);
-            _setWifiConnected(WiFi.status() == WL_CONNECTED);
-            if (WifiConnected) {
+            if (WiFi.status() == WL_CONNECTED) {
+                _setWifiConnected(true, WiFi.localIP());
                 udp.begin(apppref.port);
                 Serial.printf("\n接続完了! IPアドレス: %s\n", WiFi.localIP().toString().c_str());
             }
@@ -132,10 +134,9 @@ protected:
     }
 };
 
-IPAddress NULL_IPADDRESS{0, 0, 0, 0};
 class APUDPReceiveTask : public rtos::Task {
 private:
-    uint8_t packetBuffer[512 * 3]; // 足りる？
+    // uint8_t packetBuffer[512 * 3]; // 足りる？
 
     // x.y.z.w(/net)
     std::pair<bool, std::pair<IPAddress, IPAddress>> _parse_ip_net(const String& ip_net) {
@@ -183,9 +184,9 @@ private:
 public:
     APUDPReceiveTask() : rtos::Task("APudprcv", 4096, 2) {
         auto parsedIPNET = _parse_ip_net(apppref.ap_ip_net);
+        _setWifiConnected(false, NULL_IPADDRESS);
         if (!parsedIPNET.first) {
             Serial.printf("IP/NET の構文にエラーがあります: [%s]\n", apppref.ap_ip_net);
-            _setWifiConnected(false);
         } else {
             WiFi.disconnect(true);
             WiFi.mode(WIFI_AP);
@@ -197,10 +198,10 @@ public:
                 if (!WiFi.softAPConfig(parsedIPNET.second.first, parsedIPNET.second.first, parsedIPNET.second.second)) {
                     Serial.println("SoftAPの構成に失敗しました");
                 } else {
-                    Serial.printf("SoftAP IP address=[%s]\n", WiFi.softAPIP().toString().c_str());
                     esp_wifi_set_ps(WIFI_PS_NONE);
+                    _setWifiConnected(true, WiFi.softAPIP());
                     udp.begin(apppref.port);
-                    _setWifiConnected(true);
+                    Serial.printf("SoftAP IP address=[%s]\n", WifiIPAddress.toString().c_str());
                 }
             }
         }
@@ -240,7 +241,7 @@ void setupI2S() {
             .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
             .communication_format = I2S_COMM_FORMAT_STAND_I2S,
             .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-            .dma_buf_count = 4,
+            .dma_buf_count = 6,
             .dma_buf_len = 128,
             .use_apll = false,
             .tx_desc_auto_clear = true, // データ途切れ時に無音を出力してノイズを防ぐ
@@ -270,7 +271,7 @@ void setup() {
 
     // LED status
     pinMode((int) apppref.ledpin, OUTPUT);
-    _setWifiConnected(false);
+    _setWifiConnected(false, NULL_IPADDRESS);
 
     // I2S初期化
     setupI2S();
@@ -288,11 +289,7 @@ void setup() {
             Serial.printf("SSID=[%s]\n", apppref.ssid.c_str());
             Serial.printf("Pass=[%s]\n", apppref.pass.c_str());
             Serial.printf("Wifi ... %s\n",
-                WifiConnected ? (
-                    (bool) apppref.ap_mode ?
-                        WiFi.softAPIP().toString().c_str() :
-                        WiFi.localIP().toString().c_str()
-                ) : "(not connected)"
+                WifiConnected ? WifiIPAddress.toString().c_str() : "(not connected)"
             );
             Serial.printf("AP SSID=[%s] hide=[%s]\n", apppref.ap_ssid.c_str(), (bool) apppref.ap_hide_ssid ? "HIDDEN" : "visible");
             Serial.printf("AP Pass=[%s]\n", apppref.ap_pass.c_str());

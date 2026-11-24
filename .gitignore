@@ -1,6 +1,7 @@
 .*
 **/__pycache__
 VBCABLE_Driver_Pack*.zip
+rust-wifi-audio-source/target
 
 !.gitignore
 !.python-version
