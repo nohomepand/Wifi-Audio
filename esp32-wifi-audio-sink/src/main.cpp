@@ -241,8 +241,8 @@ void setupI2S() {
             .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
             .communication_format = I2S_COMM_FORMAT_STAND_I2S,
             .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-            .dma_buf_count = 6,
-            .dma_buf_len = 128,
+            .dma_buf_count = 8,
+            .dma_buf_len = 256,
             .use_apll = false,
             .tx_desc_auto_clear = true, // データ途切れ時に無音を出力してノイズを防ぐ
             .fixed_mclk = 0
@@ -285,16 +285,14 @@ void setup() {
         }, "Show this message");
         
         appcli.registerHandler("status", [](String args) {
+            Serial.printf("Wifi ... %s\n",WifiConnected ? WifiIPAddress.toString().c_str() : "(not connected)");
+            Serial.printf("Port=[%d]\n", (uint16_t) apppref.port);
             Serial.printf("WiFi Mode=[%s]\n", (bool) apppref.ap_mode ? "AP Mode" : "STA(Client) Mode");
             Serial.printf("SSID=[%s]\n", apppref.ssid.c_str());
             Serial.printf("Pass=[%s]\n", apppref.pass.c_str());
-            Serial.printf("Wifi ... %s\n",
-                WifiConnected ? WifiIPAddress.toString().c_str() : "(not connected)"
-            );
             Serial.printf("AP SSID=[%s] hide=[%s]\n", apppref.ap_ssid.c_str(), (bool) apppref.ap_hide_ssid ? "HIDDEN" : "visible");
             Serial.printf("AP Pass=[%s]\n", apppref.ap_pass.c_str());
             Serial.printf("AP IP/NET=[%s]\n", apppref.ap_ip_net.c_str());
-            Serial.printf("Port=[%d]\n", (uint16_t) apppref.port);
             Serial.printf("LED pin=[%d] [%s]\n", (int) apppref.ledpin, (bool) apppref.invert_led ? "inverted" : "normal");
             Serial.printf("BCLK=[%d]\n", (int) apppref.bclk);
             Serial.printf("WS/LRC=[%d]\n", (int) apppref.ws_or_lrc);

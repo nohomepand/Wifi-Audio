@@ -2,17 +2,85 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-fn send_audio_chunks(socket: &std::net::UdpSocket, pending: &mut Vec<u8>, packet_size: usize) {
-    while pending.len() >= packet_size {
-        if let Err(err) = socket.send(&pending[..packet_size]) {
-            eprintln!("UDP send error: {err}");
+struct AudioSender {
+    destination: String,
+    socket: Option<std::net::UdpSocket>,
+    retry_at: Instant,
+}
+
+impl AudioSender {
+    fn connect(destination: &str) -> Result<std::net::UdpSocket> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").context("Failed to bind UDP socket")?;
+        socket
+            .connect(destination)
+            .context("Invalid destination address")?;
+        Ok(socket)
+    }
+
+    fn new(destination: String) -> Result<Self> {
+        let socket = Self::connect(&destination)?;
+        Ok(Self {
+            destination,
+            socket: Some(socket),
+            retry_at: Instant::now(),
+        })
+    }
+
+    fn send_audio_chunks(&mut self, pending: &mut Vec<u8>, packet_size: usize) {
+        while pending.len() >= packet_size {
+            if self.socket.is_none() {
+                if Instant::now() < self.retry_at {
+                    pending.clear();
+                    return;
+                }
+
+                match Self::connect(&self.destination) {
+                    Ok(socket) => {
+                        self.socket = Some(socket);
+                        eprintln!("UDP connection restored: {}", self.destination);
+                    }
+                    Err(err) => {
+                        eprintln!("UDP reconnect error: {err}");
+                        self.retry_at = Instant::now() + Duration::from_secs(1);
+                        pending.clear();
+                        return;
+                    }
+                }
+            }
+
+            let send_result = self
+                .socket
+                .as_ref()
+                .expect("socket was connected above")
+                .send(&pending[..packet_size]);
+            match send_result {
+                Ok(bytes_sent) if bytes_sent == packet_size => {
+                    pending.drain(..packet_size);
+                }
+                Ok(bytes_sent) => {
+                    eprintln!(
+                        "UDP send error: sent {bytes_sent} of {packet_size} bytes; reconnecting"
+                    );
+                    self.socket = None;
+                    self.retry_at = Instant::now() + Duration::from_secs(1);
+                    pending.clear();
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("UDP send error: {err}; reconnecting");
+                    self.socket = None;
+                    self.retry_at = Instant::now() + Duration::from_secs(1);
+                    pending.clear();
+                    return;
+                }
+            }
         }
-        pending.drain(..packet_size);
     }
 }
 
@@ -109,10 +177,7 @@ fn main() -> Result<()> {
         anyhow::bail!("--block-size must be 128, 256, 384, or 512");
     }
 
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").context("Failed to bind UDP socket")?;
-    socket
-        .connect(&args.ip_port)
-        .context("Invalid destination address")?;
+    let sender = AudioSender::new(args.ip_port.clone())?;
 
     let device = find_wasapi_cable_output()?;
     let device_name = device
@@ -134,7 +199,7 @@ fn main() -> Result<()> {
         let stream = device.build_input_stream(
             &config,
             {
-                let socket = socket.try_clone()?;
+                let mut sender = sender;
                 let mut pending = Vec::with_capacity(args.blocksize as usize * 4);
                 let packet_size = args.blocksize as usize * 2 * std::mem::size_of::<i16>();
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -145,7 +210,7 @@ fn main() -> Result<()> {
                         )
                     };
                     pending.extend_from_slice(bytes);
-                    send_audio_chunks(&socket, &mut pending, packet_size);
+                    sender.send_audio_chunks(&mut pending, packet_size);
                 }
             },
             |err| eprintln!("Audio stream error: {err}"),
@@ -156,7 +221,7 @@ fn main() -> Result<()> {
         let stream = device.build_input_stream(
             &config,
             {
-                let socket = socket.try_clone()?;
+                let mut sender = sender;
                 let mut pending = Vec::with_capacity(args.blocksize as usize * 8);
                 let packet_size = args.blocksize as usize * 2 * std::mem::size_of::<i32>();
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
@@ -167,12 +232,37 @@ fn main() -> Result<()> {
                         )
                     };
                     pending.extend_from_slice(bytes);
-                    send_audio_chunks(&socket, &mut pending, packet_size);
+                    sender.send_audio_chunks(&mut pending, packet_size);
                 }
             },
             |err| eprintln!("Audio stream error: {err}"),
             None,
         )?;
         wait_for_stop(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnects_socket_before_sending_pending_audio() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let destination = receiver.local_addr().unwrap().to_string();
+        let mut sender = AudioSender::new(destination).unwrap();
+        sender.socket = None;
+        sender.retry_at = Instant::now();
+        let mut pending = vec![1, 2, 3, 4];
+
+        sender.send_audio_chunks(&mut pending, 4);
+
+        assert!(pending.is_empty());
+        let mut received = [0; 4];
+        assert_eq!(receiver.recv(&mut received).unwrap(), received.len());
+        assert_eq!(received, [1, 2, 3, 4]);
     }
 }
